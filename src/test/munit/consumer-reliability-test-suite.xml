@@ -17,9 +17,9 @@
     <ee:transform doc:name="Requeue message">
       <ee:variables>
         <ee:set-variable variableName="requeueMsg"><![CDATA[%dw 2.0
-output application/json
+output application/java
 ---
-vars.envelope ++ { transientRetries: (vars.envelope.transientRetries default 0) + 1 }]]></ee:set-variable>
+(vars.envelope - "transientRetries") ++ { transientRetries: ((vars.envelope.transientRetries default 0) as Number) + 1 }]]></ee:set-variable>
       </ee:variables>
     </ee:transform>
   </sub-flow>
@@ -29,7 +29,7 @@ vars.envelope ++ { transientRetries: (vars.envelope.transientRetries default 0) 
       <ee:variables>
         <ee:set-variable variableName="dlqMsg"><![CDATA[%dw 2.0
 import modules::Masking
-output application/json
+output application/java
 ---
 {
   reason: "MULE:EXPRESSION - Invalid JSON format",
@@ -50,9 +50,9 @@ output application/json
       <ee:transform>
         <ee:variables>
           <ee:set-variable variableName="envelope"><![CDATA[%dw 2.0
-output application/json
+output application/java
 ---
-{ correlationId: "c-1", velocityCount: 1, transientRetries: 0, scoring: { riskScore: 82, riskBand: "HIGH" },
+{ correlationId: "c-1", velocityCount: 1, scoring: { riskScore: 82, riskBand: "HIGH" },
   event: { eventId: "T-9", transaction: { transactionId: "TX-9", amount: 248500, currency: "INR" } } }]]></ee:set-variable>
         </ee:variables>
       </ee:transform>
