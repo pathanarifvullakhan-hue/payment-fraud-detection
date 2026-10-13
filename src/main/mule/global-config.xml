@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:email="http://www.mulesoft.org/schema/mule/email"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+        http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <!-- ===== Environment, properties, secure properties ===== -->
+  <global-property name="env" value="dev" doc:name="Global Property"/>
+  <configuration-properties file="config-${env}.yaml" doc:name="Config properties"/>
+  <secure-properties:config name="Secure_Properties_Config" file="secure-${env}.yaml" key="${secure.key}" doc:name="Secure Properties">
+    <secure-properties:encrypt algorithm="Blowfish"/>
+  </secure-properties:config>
+  <configuration defaultErrorHandler-ref="globalErrorHandler" doc:name="Configuration"/>
+
+
+  <!-- ===== Connector configs ===== -->
+  <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+    <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+  </http:listener-config>
+
+  <apikit:config name="payment-api-config" api="api/payment-events-api.raml" outboundHeadersMapName="outboundHeaders" httpStatusVarName="httpStatus" doc:name="APIkit Config"/>
+
+
+  <db:config name="Database_Config" doc:name="Database Config">
+    <db:my-sql-connection host="${db.host}" port="${db.port}" user="${db.user}" password="${secure::db.password}" database="${db.name}">
+      <reconnection><reconnect frequency="2000" count="3"/></reconnection>
+    </db:my-sql-connection>
+  </db:config>
+
+  <!-- For real SMTP use <email:smtps-connection>; for local dev run MailHog/smtp4dev on port 1025 -->
+  <email:smtp-config name="SMTP_Config" doc:name="SMTP Config">
+    <email:smtp-connection host="${smtp.host}" port="${smtp.port}" user="${secure::smtp.user}" password="${secure::smtp.password}"/>
+  </email:smtp-config>
+
+  <vm:config name="VM_Config" doc:name="VM Config">
+    <vm:queues>
+      <!-- PERSISTENT = written to disk, survives an app restart. Three payment queues + one alert queue. -->
+      <vm:queue queueName="payments-high-q" queueType="PERSISTENT" maxOutstandingMessages="100000"/>
+      <vm:queue queueName="payments-std-q" queueType="PERSISTENT" maxOutstandingMessages="100000"/>
+      <vm:queue queueName="payments-dlq" queueType="PERSISTENT" maxOutstandingMessages="100000"/>
+      <vm:queue queueName="alertQueue" queueType="PERSISTENT"/>
+    </vm:queues>
+  </vm:config>
+
+  <!-- ===== Object stores ===== -->
+  <os:object-store name="dedupStore" persistent="true" entryTtl="${dedupe.ttlHours}" entryTtlUnit="HOURS" maxEntries="500000" doc:name="Dedupe Store"/>
+  <os:object-store name="velocityStore" persistent="true" entryTtl="${risk.velocityWindowSeconds}" entryTtlUnit="SECONDS" maxEntries="500000" doc:name="Velocity Store"/>
+  <os:object-store name="alertThrottleStore" persistent="true" entryTtl="${alert.throttle.storeTtlMinutes}" entryTtlUnit="MINUTES" maxEntries="100000" doc:name="Alert Throttle Store"/>
+  <os:object-store name="spikeStore" persistent="true" entryTtl="10" entryTtlUnit="MINUTES" doc:name="Spike cooldown Store"/>
+
+  <!-- ===== GLOBAL ERROR HANDLER (default for every flow without its own handler) ===== -->
+  <error-handler name="globalErrorHandler">
+
+    <!-- 400: malformed JSON / schema violation. logException=false so offending values never hit the log -->
+    <on-error-propagate type="APIKIT:BAD_REQUEST" enableNotifications="false" logException="false">
+      <logger level="WARN" category="${app.logCategory}.error" message="#[output text/plain --- 'INVALID_PAYMENT_EVENT corrId=' ++ correlationId]"/>
+      <ee:transform doc:name="400 body">
+        <ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::ErrorResponse
+output application/json
+---
+ErrorResponse::build("INVALID_PAYMENT_EVENT", "Payment event failed validation. See 'fields' for offending paths.", correlationId, ErrorResponse::fieldPaths(error.description))]]></ee:set-payload></ee:message>
+        <ee:variables><ee:set-variable variableName="httpStatus">400</ee:set-variable></ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <!-- other APIkit router errors -->
+    <on-error-propagate type="APIKIT:NOT_FOUND, APIKIT:METHOD_NOT_ALLOWED, APIKIT:NOT_ACCEPTABLE, APIKIT:UNSUPPORTED_MEDIA_TYPE, APIKIT:NOT_IMPLEMENTED" enableNotifications="false" logException="false">
+      <logger level="WARN" category="${app.logCategory}.error" message="#[output text/plain --- 'API_ROUTING_ERROR type=' ++ error.errorType.identifier ++ ' corrId=' ++ correlationId]"/>
+      <ee:transform doc:name="4xx body">
+        <ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::ErrorResponse
+output application/json
+---
+ErrorResponse::build(error.errorType.identifier, "Request could not be processed.", correlationId)]]></ee:set-payload></ee:message>
+        <ee:variables><ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/java
+---
+{ "NOT_FOUND": 404, "METHOD_NOT_ALLOWED": 405, "NOT_ACCEPTABLE": 406, "UNSUPPORTED_MEDIA_TYPE": 415, "NOT_IMPLEMENTED": 501 }[error.errorType.identifier] default 400]]></ee:set-variable></ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <!-- 409: duplicate event id -->
+    <on-error-propagate type="OS:KEY_ALREADY_EXISTS" enableNotifications="false" logException="false">
+      <logger level="WARN" category="${app.logCategory}.error" message="#[output text/plain --- 'DUPLICATE_EVENT eventId=' ++ (vars.eventId default 'n/a') ++ ' corrId=' ++ correlationId]"/>
+      <ee:transform doc:name="409 body">
+        <ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::ErrorResponse
+output application/json
+---
+ErrorResponse::build("DUPLICATE_EVENT", "This eventId was already accepted. No further processing performed.", correlationId)]]></ee:set-payload></ee:message>
+        <ee:variables><ee:set-variable variableName="httpStatus">409</ee:set-variable></ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <!-- 503: queue / dependency unavailable -> NOT accepted, caller must retry -->
+    <on-error-propagate type="MULE:RETRY_EXHAUSTED, DB:CONNECTIVITY" enableNotifications="true" logException="false">
+      <logger level="ERROR" category="${app.logCategory}.error" message="#[output text/plain --- 'DEPENDENCY_UNAVAILABLE eventId=' ++ (vars.eventId default 'n/a') ++ ' type=' ++ error.errorType.identifier ++ ' corrId=' ++ correlationId]"/>
+      <ee:transform doc:name="503 body">
+        <ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::ErrorResponse
+output application/json
+---
+ErrorResponse::build("SERVICE_UNAVAILABLE", "Event could not be queued. It was NOT accepted; please retry.", correlationId)]]></ee:set-payload></ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">503</ee:set-variable>
+          <ee:set-variable variableName="outboundHeaders"><![CDATA[%dw 2.0
+output application/java
+---
+{ "Retry-After": "5" }]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <!-- 500: anything else. No internal details leak; only the correlation id -->
+    <on-error-propagate type="ANY" enableNotifications="true" logException="false">
+      <logger level="ERROR" category="${app.logCategory}.error" message="#[output text/plain --- 'UNEXPECTED_ERROR type=' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ' eventId=' ++ (vars.eventId default 'n/a') ++ ' corrId=' ++ correlationId]"/>
+      <ee:transform doc:name="500 body">
+        <ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::ErrorResponse
+output application/json
+---
+ErrorResponse::build("INTERNAL_ERROR", "An unexpected error occurred. Quote the correlationId to support.", correlationId)]]></ee:set-payload></ee:message>
+        <ee:variables><ee:set-variable variableName="httpStatus">500</ee:set-variable></ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+  </error-handler>
+
+  <!-- ===== Shared: risk config loaded from externalised properties ===== -->
+  <sub-flow name="load-risk-config-sf">
+    <ee:transform doc:name="Build riskCfg">
+      <ee:variables>
+        <ee:set-variable variableName="riskCfg"><![CDATA[%dw 2.0
+output application/java
+---
+{
+  amountLimit: p('risk.amountLimit') as Number,
+  velocityMax: p('risk.velocityMax') as Number,
+  highRiskCategories: (p('risk.highRiskCategories') splitBy ",") map upper(trim($)),
+  usualHourStart: p('risk.usualHourStart') as Number,
+  usualHourEnd: p('risk.usualHourEnd') as Number,
+  wAmount: p('risk.weight.amount') as Number,
+  wGeo: p('risk.weight.geo') as Number,
+  wVelocity: p('risk.weight.velocity') as Number,
+  wMerchant: p('risk.weight.merchant') as Number,
+  wHour: p('risk.weight.hour') as Number,
+  wWatchlist: p('risk.weight.watchlist') as Number,
+  mediumMin: p('risk.band.mediumMin') as Number,
+  highMin: p('risk.band.highMin') as Number,
+  blockMin: p('risk.band.blockMin') as Number,
+  failSafeScore: p('risk.failSafeScore') as Number
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </sub-flow>
+</mule>

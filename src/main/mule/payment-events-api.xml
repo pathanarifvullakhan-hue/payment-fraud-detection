@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:email="http://www.mulesoft.org/schema/mule/email"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+        http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <!-- ===== MAIN FLOW: listener -> APIkit router. Errors fall to globalErrorHandler ===== -->
+  <flow name="payment-events-api-main">
+    <http:listener config-ref="HTTP_Listener_config" path="/api/*" doc:name="Listener">
+      <http:response statusCode="#[vars.httpStatus default 200]">
+        <http:headers><![CDATA[#[((vars.outboundHeaders default {}) ++ { "X-Correlation-ID": correlationId })]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:body>#[payload]</http:body>
+        <http:headers><![CDATA[#[((vars.outboundHeaders default {}) ++ { "X-Correlation-ID": correlationId })]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+    <apikit:router config-ref="payment-api-config" doc:name="APIkit Router"/>
+  </flow>
+
+  <!-- ===== POST /payments/events ===== -->
+  <flow name="post:\payments\events:application\json:payment-api-config">
+    <set-variable variableName="event" value="#[payload]" doc:name="Keep event"/>
+    <set-variable variableName="eventId" value="#[payload.eventId]" doc:name="eventId"/>
+    <set-variable variableName="corrId" value="#[correlationId]" doc:name="corrId"/>
+    <logger level="INFO" category="${app.logCategory}.intake" message="#[output text/plain --- 'INTAKE_RECEIVED corrId=' ++ vars.corrId ++ ' eventId=' ++ vars.eventId ++ ' txn=' ++ vars.event.transaction.transactionId ++ ' card=' ++ (vars.event.card.maskedCardNumber[-4 to -1] default '')]"/>
+
+    <flow-ref name="load-risk-config-sf" doc:name="Load risk config"/>
+    <flow-ref name="dedupe-event-sf" doc:name="Dedupe"/>
+    <flow-ref name="velocity-update-sf" doc:name="Velocity"/>
+    <flow-ref name="score-event-sf" doc:name="Score + Band"/>
+    <flow-ref name="publish-scored-event-sf" doc:name="Publish to priority queue"/>
+
+    <ee:transform doc:name="202 response">
+      <ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  eventId: vars.event.eventId,
+  transactionId: vars.event.transaction.transactionId,
+  riskScore: vars.scoring.riskScore,
+  riskBand: vars.scoring.riskBand,
+  status: if (vars.scoring.riskBand == "HIGH") "QUEUED_FOR_REVIEW" else "QUEUED_FOR_SCORING",
+  correlationId: vars.corrId
+}]]></ee:set-payload></ee:message>
+      <ee:variables><ee:set-variable variableName="httpStatus">202</ee:set-variable></ee:variables>
+    </ee:transform>
+    <logger level="INFO" category="${app.logCategory}.intake" message="#[output text/plain --- 'INTAKE_ACCEPTED corrId=' ++ vars.corrId ++ ' eventId=' ++ vars.eventId ++ ' score=' ++ vars.scoring.riskScore ++ ' band=' ++ vars.scoring.riskBand ++ ' queue=' ++ vars.targetQueue]"/>
+
+    <error-handler>
+      <!-- COMPENSATION: anything except "duplicate" must release the dedupe key so the caller's retry is not rejected as duplicate -->
+      <on-error-propagate when="#[error.errorType.identifier != 'KEY_ALREADY_EXISTS']" logException="false" enableNotifications="false">
+        <try doc:name="Release dedupe key">
+          <os:remove key="#[vars.eventId]" objectStore="dedupStore"/>
+          <error-handler>
+            <on-error-continue>
+              <logger level="WARN" category="${app.logCategory}.intake" message="#[output text/plain --- 'DEDUPE_RELEASE_SKIPPED eventId=' ++ (vars.eventId default 'n/a')]"/>
+            </on-error-continue>
+          </error-handler>
+        </try>
+      </on-error-propagate>
+    </error-handler>
+  </flow>
+
+  <!-- Atomic duplicate detection: store with failIfPresent => OS:KEY_ALREADY_EXISTS -->
+  <sub-flow name="dedupe-event-sf">
+    <os:store key="#[vars.eventId]" objectStore="dedupStore" failIfPresent="true" doc:name="Store eventId (fail if present)">
+      <os:value>#[vars.corrId]</os:value>
+    </os:store>
+  </sub-flow>
+
+  <!-- Velocity: sliding window of epoch-seconds per card token -->
+  <sub-flow name="velocity-update-sf">
+    <os:retrieve key="#['vel-' ++ vars.event.card.cardToken]" objectStore="velocityStore" target="velHistory" doc:name="Get history">
+      <os:default-value>#[[]]</os:default-value>
+    </os:retrieve>
+    <ee:transform doc:name="Slide window">
+      <ee:variables>
+        <ee:set-variable variableName="velWindow"><![CDATA[%dw 2.0
+output application/java
+var nowEpoch = now() as Number
+var windowSec = p('risk.velocityWindowSeconds') as Number
+---
+((vars.velHistory default []) filter ($ > nowEpoch - windowSec)) ++ [nowEpoch]]]></ee:set-variable>
+        <ee:set-variable variableName="velocityCount"><![CDATA[%dw 2.0
+output application/java
+var nowEpoch = now() as Number
+var windowSec = p('risk.velocityWindowSeconds') as Number
+---
+sizeOf(((vars.velHistory default []) filter ($ > nowEpoch - windowSec)) ++ [nowEpoch])]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <os:store key="#['vel-' ++ vars.event.card.cardToken]" objectStore="velocityStore" failIfPresent="false" doc:name="Save history">
+      <os:value>#[vars.velWindow]</os:value>
+    </os:store>
+  </sub-flow>
+
+  <!-- Score + band. FAIL-SAFE: any exception => MEDIUM + scoringFailed flag => consumer forces REVIEW -->
+  <sub-flow name="score-event-sf">
+    <try doc:name="Try score">
+      <ee:transform doc:name="Evaluate rules">
+        <ee:variables>
+          <ee:set-variable variableName="scoring"><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/java
+var r = RiskRules::evaluate(vars.event, { velocityCount: vars.velocityCount, profile: null }, vars.riskCfg)
+---
+{ riskScore: r.score, riskBand: RiskRules::band(r.score, vars.riskCfg), ruleHits: r.hits, scoringFailed: false }]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+      <error-handler>
+        <on-error-continue enableNotifications="true" logException="false">
+          <logger level="ERROR" category="${app.logCategory}.scoring" message="#[output text/plain --- 'SCORING_FAILURE failSafe=REVIEW eventId=' ++ vars.eventId ++ ' corrId=' ++ vars.corrId ++ ' type=' ++ error.errorType.identifier]"/>
+          <ee:transform doc:name="Fail-safe scoring">
+            <ee:variables>
+              <ee:set-variable variableName="scoring"><![CDATA[%dw 2.0
+output application/java
+---
+{ riskScore: vars.riskCfg.failSafeScore, riskBand: "MEDIUM", ruleHits: [], scoringFailed: true }]]></ee:set-variable>
+            </ee:variables>
+          </ee:transform>
+        </on-error-continue>
+      </error-handler>
+    </try>
+  </sub-flow>
+
+  <!-- Priority routing + explicit assertion + logged fallback -->
+  <sub-flow name="publish-scored-event-sf">
+    <ee:transform doc:name="Build envelope">
+      <ee:variables>
+        <ee:set-variable variableName="envelope"><![CDATA[%dw 2.0
+output application/json
+---
+{ correlationId: vars.corrId, receivedAt: now(), velocityCount: vars.velocityCount, scoring: vars.scoring, event: vars.event }]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <set-variable variableName="targetQueue" value="#[if (vars.scoring.riskBand == 'HIGH') p('vm.queue.high') else p('vm.queue.standard')]" doc:name="Routing decision"/>
+    <logger level="INFO" category="${app.logCategory}.routing" message="#[output text/plain --- 'ROUTING eventId=' ++ vars.eventId ++ ' band=' ++ vars.scoring.riskBand ++ ' queue=' ++ vars.targetQueue ++ ' corrId=' ++ vars.corrId]"/>
+    <try doc:name="Publish with fallback">
+      <flow-ref name="queue-publish-sf"/>
+      <error-handler>
+        <on-error-continue>
+          <choice>
+            <when expression="#[vars.scoring.riskBand == 'HIGH']">
+              <!-- HIGH could not reach the high queue: fall back to standard (consumer re-checks band, never approves silently) -->
+              <logger level="WARN" category="${app.logCategory}.routing" message="#[output text/plain --- 'PRIORITY_FALLBACK eventId=' ++ vars.eventId ++ ' HIGH event diverted to standard queue corrId=' ++ vars.corrId]"/>
+              <set-variable variableName="targetQueue" value="#[p('vm.queue.standard')]"/>
+              <flow-ref name="queue-publish-sf"/>
+            </when>
+            <otherwise>
+              <!-- re-throw: the caller must NOT be told the event was accepted -->
+              <raise-error type="MULE:RETRY_EXHAUSTED" description="Queue unavailable"/>
+            </otherwise>
+          </choice>
+        </on-error-continue>
+      </error-handler>
+    </try>
+  </sub-flow>
+
+  <sub-flow name="queue-publish-sf">
+    <until-successful maxRetries="${retry.queue.max}" millisBetweenRetries="${retry.queue.delayMs}" doc:name="Retry publish">
+      <vm:publish config-ref="VM_Config" queueName="#[vars.targetQueue]" timeout="5" timeoutUnit="SECONDS" doc:name="Publish to VM queue">
+        <vm:content>#[vars.envelope]</vm:content>
+      </vm:publish>
+    </until-successful>
+  </sub-flow>
+</mule>

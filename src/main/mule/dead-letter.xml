@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:email="http://www.mulesoft.org/schema/mule/email"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+        http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <!-- ===== DEAD-LETTER WRITER: drains payments-dlq into the dead_letter_events table so every failed event has a recorded reason ===== -->
+  <flow name="dead-letter-writer-flow">
+    <vm:listener config-ref="VM_Config" queueName="${vm.queue.dlq}" numberOfConsumers="1" transactionalAction="NONE" doc:name="Listener DLQ"/>
+    <set-variable variableName="rawDlq" value="#[if (payload is String) payload else write(payload, 'application/json')]" doc:name="rawDlq"/>
+    <ee:transform doc:name="Build DLQ row">
+      <ee:variables>
+        <ee:set-variable variableName="dlRow"><![CDATA[%dw 2.0
+output application/java
+var d = read(vars.rawDlq, "application/json")
+---
+{
+  eventId: d.eventId,
+  correlationId: d.correlationId,
+  sourceQueue: d.sourceQueue,
+  reason: ((d.reason default "unknown") as String)[0 to 998],
+  retries: d.transientRetries default 0,
+  payload: d.originalPayload,
+  failedAt: ((d.failedAt as DateTime) >> "UTC") as String { format: "yyyy-MM-dd HH:mm:ss" }
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <until-successful maxRetries="${retry.db.max}" millisBetweenRetries="${retry.db.delayMs}" doc:name="Retry DB">
+      <db:insert config-ref="Database_Config" doc:name="Insert dead_letter_events">
+        <db:sql>INSERT INTO dead_letter_events (event_id, correlation_id, source_queue, reason, transient_retries, original_payload, failed_at)
+                VALUES (:eventId, :correlationId, :sourceQueue, :reason, :retries, :payload, :failedAt)</db:sql>
+        <db:input-parameters>#[vars.dlRow]</db:input-parameters>
+      </db:insert>
+    </until-successful>
+    <logger level="WARN" category="${app.logCategory}.dlq" message="#[output text/plain --- 'DLQ_RECORDED eventId=' ++ (vars.dlRow.eventId default 'n/a') ++ ' corrId=' ++ (vars.dlRow.correlationId default 'n/a')]"/>
+    <error-handler>
+      <!-- DB down: put the dead letter back on the DLQ after a pause. A dead letter is never discarded. -->
+      <on-error-continue logException="false">
+        <logger level="ERROR" category="${app.logCategory}.dlq" message="#[output text/plain --- 'DLQ_WRITE_FAILED type=' ++ error.errorType.identifier ++ ' -> requeue to DLQ']"/>
+        <flow-ref name="transient-backoff-sf"/>
+        <vm:publish config-ref="VM_Config" queueName="${vm.queue.dlq}" timeout="5" timeoutUnit="SECONDS">
+          <vm:content>#[vars.rawDlq]</vm:content>
+        </vm:publish>
+      </on-error-continue>
+    </error-handler>
+  </flow>
+
+  <!-- ===== DLQ DEPTH MONITOR: replaces the Anypoint MQ "queue depth" alert. Emails ops when OPEN dead letters exceed the threshold ===== -->
+  <flow name="dead-letter-monitor-flow">
+    <scheduler doc:name="Every minute"><scheduling-strategy><fixed-frequency frequency="60000"/></scheduling-strategy></scheduler>
+    <db:select config-ref="Database_Config" target="dlqRows" doc:name="Count OPEN dead letters">
+      <db:sql>SELECT COUNT(*) AS cnt FROM dead_letter_events WHERE status = 'OPEN'</db:sql>
+    </db:select>
+    <os:contains key="dlq-cooldown" objectStore="spikeStore" target="dlqCooling"/>
+    <choice>
+      <when expression="#[(vars.dlqRows[0].cnt as Number) &gt; (p('monitor.dlqThreshold') as Number) and not vars.dlqCooling]">
+        <logger level="ERROR" category="${app.logCategory}.monitor" message="#[output text/plain --- 'DLQ_DEPTH_ALERT open=' ++ vars.dlqRows[0].cnt]"/>
+        <email:send config-ref="SMTP_Config" fromAddress="${smtp.from}" subject="#['[MONITOR] Dead-letter events waiting: ' ++ vars.dlqRows[0].cnt]">
+          <email:to-addresses><email:to-address value="${monitor.opsList}"/></email:to-addresses>
+          <email:body contentType="text/plain; charset=UTF-8"><email:content>Payment events could not be processed. See table dead_letter_events (status = OPEN) for the recorded reason of each.</email:content></email:body>
+        </email:send>
+        <os:store key="dlq-cooldown" objectStore="spikeStore" failIfPresent="false"><os:value>#[true]</os:value></os:store>
+      </when>
+    </choice>
+    <error-handler>
+      <on-error-continue logException="false">
+        <logger level="WARN" category="${app.logCategory}.monitor" message="#[output text/plain --- 'DLQ_MONITOR_FAILED type=' ++ error.errorType.identifier]"/>
+      </on-error-continue>
+    </error-handler>
+  </flow>
+</mule>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration>
+  <Properties>
+    <!-- %replace redacts any run of 13+ contiguous digits (a raw PAN) from every log message: defence in depth.
+         Brace-free regex on purpose: log4j2 option parsing dislikes {n,m} inside %replace. -->
+    <Property name="LOG_PATTERN">%d{yyyy-MM-dd HH:mm:ss.SSS} %-5p [%t] [%X{correlationId}] %c{1} - %replace{%m}{\d\d\d\d\d\d\d\d\d\d\d\d\d\d*}{[REDACTED-PAN]}%n</Property>
+  </Properties>
+  <Appenders>
+    <Console name="Console"><PatternLayout pattern="${LOG_PATTERN}"/></Console>
+    <RollingFile name="File" fileName="${sys:mule.home}${sys:file.separator}logs${sys:file.separator}fraud-detection.log"
+                 filePattern="${sys:mule.home}${sys:file.separator}logs${sys:file.separator}fraud-detection-%i.log">
+      <PatternLayout pattern="${LOG_PATTERN}"/>
+      <SizeBasedTriggeringPolicy size="10 MB"/>
+      <DefaultRolloverStrategy max="5"/>
+    </RollingFile>
+  </Appenders>
+  <Loggers>
+    <AsyncLogger name="com.cts.fraud" level="INFO"/>
+    <AsyncLogger name="org.mule.runtime.core.internal.processor.LoggerMessageProcessor" level="INFO"/>
+    <AsyncRoot level="WARN"><AppenderRef ref="Console"/><AppenderRef ref="File"/></AsyncRoot>
+  </Loggers>
+</Configuration>

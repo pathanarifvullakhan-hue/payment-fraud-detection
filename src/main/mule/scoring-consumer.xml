@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:email="http://www.mulesoft.org/schema/mule/email"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+        http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <!-- ===== Two listeners: the HIGH queue gets MORE consumer threads, so suspicious activity is always scored and alerted first ===== -->
+  <flow name="scoring-consumer-high-flow">
+    <vm:listener config-ref="VM_Config" queueName="${vm.queue.high}" numberOfConsumers="${consumer.high.concurrency}" transactionalAction="NONE" doc:name="Listener HIGH queue"/>
+    <set-variable variableName="sourceQueue" value="${vm.queue.high}" doc:name="sourceQueue"/>
+    <flow-ref name="process-scored-event-sf" doc:name="Process event"/>
+    <error-handler ref="consumerErrorHandler"/>
+  </flow>
+
+  <flow name="scoring-consumer-standard-flow">
+    <vm:listener config-ref="VM_Config" queueName="${vm.queue.standard}" numberOfConsumers="${consumer.standard.concurrency}" transactionalAction="NONE" doc:name="Listener STANDARD queue"/>
+    <set-variable variableName="sourceQueue" value="${vm.queue.standard}" doc:name="sourceQueue"/>
+    <flow-ref name="process-scored-event-sf" doc:name="Process event"/>
+    <error-handler ref="consumerErrorHandler"/>
+  </flow>
+
+  <sub-flow name="process-scored-event-sf">
+    <!-- keep the raw text FIRST: it is what we re-queue or dead-letter if anything fails later -->
+    <set-variable variableName="rawBody" value="#[if (payload is String) payload else write(payload, 'application/json')]" doc:name="rawBody"/>
+
+    <ee:transform doc:name="Parse envelope">
+      <ee:variables>
+        <ee:set-variable variableName="envelope"><![CDATA[%dw 2.0
+output application/java
+---
+read(vars.rawBody, "application/json")]]></ee:set-variable>
+        <ee:set-variable variableName="corrId"><![CDATA[%dw 2.0
+output application/java
+---
+read(vars.rawBody, "application/json").correlationId default correlationId]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <set-variable variableName="eventId" value="#[vars.envelope.event.eventId]" doc:name="eventId"/>
+    <logger level="INFO" category="${app.logCategory}.consumer" message="#[output text/plain --- 'CONSUME_START eventId=' ++ vars.eventId ++ ' corrId=' ++ vars.corrId ++ ' queue=' ++ vars.sourceQueue ++ ' transientRetries=' ++ (vars.envelope.transientRetries default 0)]"/>
+
+    <!-- Priority-misrouting assertion: a HIGH event must never be silently treated as standard -->
+    <choice>
+      <when expression="#[vars.envelope.scoring.riskBand == 'HIGH' and vars.sourceQueue != p('vm.queue.high')]">
+        <logger level="WARN" category="${app.logCategory}.routing" message="#[output text/plain --- 'PRIORITY_MISROUTE eventId=' ++ vars.eventId ++ ' HIGH event consumed from standard queue; handled as HIGH corrId=' ++ vars.corrId]"/>
+      </when>
+      <otherwise><logger level="DEBUG" category="${app.logCategory}.routing" message="routing ok"/></otherwise>
+    </choice>
+
+    <flow-ref name="load-risk-config-sf" doc:name="Load risk config"/>
+    <flow-ref name="enrich-customer-profile-sf" doc:name="Enrich with profile"/>
+
+    <ee:transform doc:name="Finalize decision">
+      <ee:variables>
+        <ee:set-variable variableName="final"><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/java
+---
+RiskRules::finalize(vars.envelope, vars.profile, vars.riskCfg)]]></ee:set-variable>
+        <ee:set-variable variableName="alertRequired"><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/java
+var f = RiskRules::finalize(vars.envelope, vars.profile, vars.riskCfg)
+---
+f.riskBand == "HIGH" or f.decision == "BLOCK"]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <!-- If this throws (DB down) the message is put back on the queue by consumerErrorHandler - it is never dropped -->
+    <flow-ref name="persist-fraud-event-sf" doc:name="Persist"/>
+
+    <choice>
+      <when expression="#[vars.alertRequired]">
+        <!-- The DB row already says alert_status=PENDING, so if this hand-off fails the reconciler recovers it -->
+        <try doc:name="Hand off to alert pipeline">
+          <flow-ref name="enqueue-alert-sf"/>
+          <error-handler>
+            <on-error-continue logException="false">
+              <logger level="ERROR" category="${app.logCategory}.alert" message="#[output text/plain --- 'ALERT_ENQUEUE_FAILED eventId=' ++ vars.eventId ++ ' reconciler will recover corrId=' ++ vars.corrId]"/>
+            </on-error-continue>
+          </error-handler>
+        </try>
+      </when>
+    </choice>
+
+    <logger level="INFO" category="${app.logCategory}.consumer" message="#[output text/plain --- 'CONSUME_DONE eventId=' ++ vars.eventId ++ ' score=' ++ vars.final.riskScore ++ ' band=' ++ vars.final.riskBand ++ ' decision=' ++ vars.final.decision ++ ' corrId=' ++ vars.corrId]"/>
+  </sub-flow>
+
+  <!-- Customer profile: missing => default profile + enrichment flag. DB outage => retried, then bubbles up => re-queue -->
+  <sub-flow name="enrich-customer-profile-sf">
+    <until-successful maxRetries="${retry.db.max}" millisBetweenRetries="${retry.db.delayMs}">
+      <db:select config-ref="Database_Config" target="profileRows" doc:name="Select profile">
+        <db:sql>SELECT customer_id, risk_profile, usual_hour_start, usual_hour_end FROM customer_risk_profile WHERE customer_id = :customerId</db:sql>
+        <db:input-parameters>#[{ customerId: vars.envelope.event.customer.customerId }]</db:input-parameters>
+      </db:select>
+    </until-successful>
+    <choice>
+      <when expression="#[isEmpty(vars.profileRows)]">
+        <logger level="WARN" category="${app.logCategory}.consumer" message="#[output text/plain --- 'PROFILE_NOT_FOUND eventId=' ++ vars.eventId ++ ' default profile applied (enrichment incomplete) corrId=' ++ vars.corrId]"/>
+        <set-variable variableName="enrichmentIncomplete" value="#[true]"/>
+        <set-variable variableName="profile" value="#[{ riskProfile: 'STANDARD', usualHourStart: p('risk.usualHourStart') as Number, usualHourEnd: p('risk.usualHourEnd') as Number }]"/>
+      </when>
+      <otherwise>
+        <set-variable variableName="enrichmentIncomplete" value="#[false]"/>
+        <set-variable variableName="profile" value="#[{ riskProfile: vars.profileRows[0].risk_profile, usualHourStart: vars.profileRows[0].usual_hour_start, usualHourEnd: vars.profileRows[0].usual_hour_end }]"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <!-- A deliberate pause. until-successful waits between attempts, so we make it fail twice on purpose. -->
+  <sub-flow name="transient-backoff-sf">
+    <try doc:name="Backoff wait">
+      <until-successful maxRetries="1" millisBetweenRetries="${consumer.transient.delayMs}">
+        <raise-error type="APP:BACKOFF" description="intentional wait before re-queue"/>
+      </until-successful>
+      <error-handler>
+        <on-error-continue logException="false">
+          <logger level="DEBUG" category="${app.logCategory}.consumer" message="backoff finished"/>
+        </on-error-continue>
+      </error-handler>
+    </try>
+  </sub-flow>
+
+  <!-- ===== Consumer error handler ===== -->
+  <error-handler name="consumerErrorHandler">
+
+    <!-- 1) TRANSIENT infrastructure problem (DB down etc.) and attempts remain => wait, then put the SAME event back on its queue.
+            The event is never lost and never acknowledged as processed. Does not count towards poison-message limits. -->
+    <on-error-continue type="DB:CONNECTIVITY, DB:QUERY_EXECUTION, MULE:RETRY_EXHAUSTED"
+                       when="#[vars.envelope != null and (vars.envelope.transientRetries default 0) &lt; (p('consumer.transient.maxRetries') as Number)]" logException="false">
+      <logger level="WARN" category="${app.logCategory}.consumer" message="#[output text/plain --- 'TRANSIENT_FAILURE_REQUEUE eventId=' ++ (vars.eventId default 'n/a') ++ ' type=' ++ error.errorType.identifier ++ ' retries=' ++ (vars.envelope.transientRetries default 0) ++ ' corrId=' ++ (vars.corrId default 'n/a')]"/>
+      <flow-ref name="transient-backoff-sf"/>
+      <try doc:name="Re-queue">
+        <ee:transform doc:name="Requeue message">
+          <ee:variables>
+            <ee:set-variable variableName="requeueMsg"><![CDATA[%dw 2.0
+output application/json
+---
+vars.envelope ++ { transientRetries: (vars.envelope.transientRetries default 0) + 1 }]]></ee:set-variable>
+          </ee:variables>
+        </ee:transform>
+        <vm:publish config-ref="VM_Config" queueName="#[vars.sourceQueue]" timeout="5" timeoutUnit="SECONDS" doc:name="Publish back to source queue">
+          <vm:content>#[vars.requeueMsg]</vm:content>
+        </vm:publish>
+        <error-handler>
+          <!-- last resort: log the (already card-masked) payload so an operator can replay it -->
+          <on-error-continue logException="false">
+            <logger level="ERROR" category="${app.logCategory}.consumer" message="#[output text/plain --- 'REQUEUE_FAILED eventId=' ++ (vars.eventId default 'n/a') ++ ' corrId=' ++ (vars.corrId default 'n/a') ++ ' payload=' ++ modules::Masking::sanitize(vars.rawBody)]"/>
+          </on-error-continue>
+        </error-handler>
+      </try>
+    </on-error-continue>
+
+    <!-- 2) Everything else (poison message, bad JSON, transient retries exhausted) => DEAD-LETTER with reason + original payload -->
+    <on-error-continue type="ANY" logException="false">
+      <logger level="ERROR" category="${app.logCategory}.consumer" message="#[output text/plain --- 'DEAD_LETTER eventId=' ++ (vars.eventId default 'n/a') ++ ' type=' ++ error.errorType.identifier ++ ' corrId=' ++ (vars.corrId default 'n/a')]"/>
+      <try doc:name="Publish DLQ">
+        <ee:transform doc:name="DLQ message">
+          <ee:variables>
+            <ee:set-variable variableName="dlqMsg"><![CDATA[%dw 2.0
+import modules::Masking
+output application/json
+---
+{
+  reason: error.errorType.namespace ++ ":" ++ error.errorType.identifier ++ " - " ++ Masking::sanitize(error.description),
+  failedAt: now(),
+  correlationId: vars.corrId default correlationId,
+  eventId: vars.eventId default null,
+  sourceQueue: vars.sourceQueue,
+  transientRetries: vars.envelope.transientRetries default 0,
+  originalPayload: Masking::sanitize(vars.rawBody)
+}]]></ee:set-variable>
+          </ee:variables>
+        </ee:transform>
+        <vm:publish config-ref="VM_Config" queueName="${vm.queue.dlq}" timeout="5" timeoutUnit="SECONDS" doc:name="Publish to DLQ">
+          <vm:content>#[vars.dlqMsg]</vm:content>
+        </vm:publish>
+        <error-handler>
+          <on-error-continue logException="false">
+            <logger level="ERROR" category="${app.logCategory}.consumer" message="#[output text/plain --- 'DLQ_PUBLISH_FAILED eventId=' ++ (vars.eventId default 'n/a') ++ ' corrId=' ++ (vars.corrId default 'n/a') ++ ' payload=' ++ modules::Masking::sanitize(vars.rawBody)]"/>
+          </on-error-continue>
+        </error-handler>
+      </try>
+    </on-error-continue>
+  </error-handler>
+</mule>

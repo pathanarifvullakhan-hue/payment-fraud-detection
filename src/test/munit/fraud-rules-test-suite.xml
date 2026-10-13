@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+  <munit:config name="fraud-rules-test-suite.xml"/>
+
+  <!-- fixtures: config + a LOW-risk baseline event that triggers NO rule -->
+  <munit:before-test name="fixtures">
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="cfg"><![CDATA[%dw 2.0
+output application/json
+---
+{ amountLimit: 100000, velocityMax: 5, highRiskCategories: ["ELECTRONICS","CRYPTO","GAMBLING"],
+  usualHourStart: 6, usualHourEnd: 23, wAmount: 35, wGeo: 30, wVelocity: 20, wMerchant: 17, wHour: 15, wWatchlist: 10,
+  mediumMin: 30, highMin: 60, blockMin: 85, failSafeScore: 45 }]]></ee:set-variable>
+        <ee:set-variable variableName="evt"><![CDATA[%dw 2.0
+output application/json
+---
+{ eventId: "T-1", eventTimestamp: "2026-09-11T14:22:07+05:30",
+  transaction: { transactionId: "TX-1", amount: 1500, currency: "INR", channel: "ONLINE" },
+  card: { cardToken: "TKN-1", maskedCardNumber: "XXXXXXXXXXXX4417", issuingCountry: "IN", cardType: "CREDIT" },
+  customer: { customerId: "C-1", name: "Test User" },
+  merchant: { merchantId: "M-1", merchantName: "Grocer", merchantCategory: "GROCERY", merchantCountry: "IN" },
+  device: { geoCountry: "IN" } }]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </munit:before-test>
+
+  <!-- ============ R01 amount ============ -->
+  <munit:test name="rule-R01-amount-in-isolation" description="Amount rule fires only ABOVE the limit">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ over: RiskRules::ruleAmount(vars.evt update { case a at .transaction.amount -> 100000.01 }, vars.cfg),
+  atLimit: RiskRules::ruleAmount(vars.evt update { case a at .transaction.amount -> 100000 }, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.over.ruleCode]" is="#[MunitTools::equalTo('R01_AMOUNT')]"/>
+      <munit-tools:assert-that expression="#[payload.atLimit]" is="#[MunitTools::nullValue()]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============ R02 geo ============ -->
+  <munit:test name="rule-R02-geo-mismatch-in-isolation" description="Fires when merchant/geo country differs from issuing country">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ merchantAbroad: RiskRules::ruleGeo(vars.evt update { case m at .merchant.merchantCountry -> "SG" }, vars.cfg),
+  deviceAbroad: RiskRules::ruleGeo(vars.evt update { case g at .device.geoCountry -> "US" }, vars.cfg),
+  domestic: RiskRules::ruleGeo(vars.evt, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.merchantAbroad.ruleCode]" is="#[MunitTools::equalTo('R02_GEO_MISMATCH')]"/>
+      <munit-tools:assert-that expression="#[payload.deviceAbroad.ruleCode]" is="#[MunitTools::equalTo('R02_GEO_MISMATCH')]"/>
+      <munit-tools:assert-that expression="#[payload.domestic]" is="#[MunitTools::nullValue()]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============ R03 velocity ============ -->
+  <munit:test name="rule-R03-velocity-in-isolation" description="Fires when count is MORE than the max">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ over: RiskRules::ruleVelocity({ velocityCount: 6 }, vars.cfg),
+  atMax: RiskRules::ruleVelocity({ velocityCount: 5 }, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.over.ruleCode]" is="#[MunitTools::equalTo('R03_VELOCITY')]"/>
+      <munit-tools:assert-that expression="#[payload.atMax]" is="#[MunitTools::nullValue()]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============ R04 merchant category ============ -->
+  <munit:test name="rule-R04-merchant-category-in-isolation" description="High risk MCC (case-insensitive) fires; grocery does not">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ crypto: RiskRules::ruleMerchant(vars.evt update { case c at .merchant.merchantCategory -> "crypto" }, vars.cfg),
+  grocery: RiskRules::ruleMerchant(vars.evt, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.crypto.ruleCode]" is="#[MunitTools::equalTo('R04_MERCHANT_CAT')]"/>
+      <munit-tools:assert-that expression="#[payload.grocery]" is="#[MunitTools::nullValue()]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============ R05 odd hour ============ -->
+  <munit:test name="rule-R05-odd-hour-in-isolation" description="03:xx and 00:xx fire, 14:xx and 23:xx (boundary) do not">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ at3am: RiskRules::ruleHour(vars.evt update { case t at .eventTimestamp -> "2026-09-11T03:10:00+05:30" }, {}, vars.cfg),
+  atMidnight: RiskRules::ruleHour(vars.evt update { case t at .eventTimestamp -> "2026-09-11T00:00:00+05:30" }, {}, vars.cfg),
+  at2pm: RiskRules::ruleHour(vars.evt, {}, vars.cfg),
+  at2359: RiskRules::ruleHour(vars.evt update { case t at .eventTimestamp -> "2026-09-11T23:59:00+05:30" }, {}, vars.cfg),
+  customRange: RiskRules::ruleHour(vars.evt, { profile: { usualHourStart: 18, usualHourEnd: 22 } }, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.at3am.ruleCode]" is="#[MunitTools::equalTo('R05_ODD_HOUR')]"/>
+      <munit-tools:assert-that expression="#[payload.atMidnight.ruleCode]" is="#[MunitTools::equalTo('R05_ODD_HOUR')]"/>
+      <munit-tools:assert-that expression="#[payload.at2pm]" is="#[MunitTools::nullValue()]"/>
+      <munit-tools:assert-that expression="#[payload.at2359]" is="#[MunitTools::nullValue()]"/>
+      <munit-tools:assert-that expression="#[payload.customRange.ruleCode]" is="#[MunitTools::equalTo('R05_ODD_HOUR')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============ band boundaries: one test each ============ -->
+  <munit:test name="band-29-is-LOW"><munit:execution>
+    <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ b: RiskRules::band(29, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform></munit:execution>
+    <munit:validation><munit-tools:assert-that expression="#[payload.b]" is="#[MunitTools::equalTo('LOW')]"/></munit:validation></munit:test>
+
+  <munit:test name="band-30-is-MEDIUM"><munit:execution>
+    <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ b: RiskRules::band(30, vars.cfg), top: RiskRules::band(59, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform></munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.b]" is="#[MunitTools::equalTo('MEDIUM')]"/>
+      <munit-tools:assert-that expression="#[payload.top]" is="#[MunitTools::equalTo('MEDIUM')]"/>
+    </munit:validation></munit:test>
+
+  <munit:test name="band-60-is-HIGH"><munit:execution>
+    <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ b: RiskRules::band(60, vars.cfg), max: RiskRules::band(100, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform></munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.b]" is="#[MunitTools::equalTo('HIGH')]"/>
+      <munit-tools:assert-that expression="#[payload.max]" is="#[MunitTools::equalTo('HIGH')]"/>
+    </munit:validation></munit:test>
+
+  <munit:test name="decision-boundaries"><munit:execution>
+    <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+---
+{ low: RiskRules::decide(10, "LOW", false, vars.cfg), high: RiskRules::decide(84, "HIGH", false, vars.cfg),
+  block: RiskRules::decide(85, "HIGH", false, vars.cfg), forced: RiskRules::decide(10, "LOW", true, vars.cfg) }]]></ee:set-payload></ee:message></ee:transform></munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.low]" is="#[MunitTools::equalTo('APPROVE')]"/>
+      <munit-tools:assert-that expression="#[payload.high]" is="#[MunitTools::equalTo('REVIEW')]"/>
+      <munit-tools:assert-that expression="#[payload.block]" is="#[MunitTools::equalTo('BLOCK')]"/>
+      <munit-tools:assert-that expression="#[payload.forced]" is="#[MunitTools::equalTo('REVIEW')]"/>
+    </munit:validation></munit:test>
+
+  <!-- ============ acceptance criteria #2: amount + geography => HIGH. Sample payload => 82 ============ -->
+  <munit:test name="sample-event-scores-82-HIGH" description="Sample from the brief: amount + geo + electronics = 82 => HIGH">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/json
+var e = vars.evt update { case a at .transaction.amount -> 248500 case m at .merchant.merchantCountry -> "SG" case g at .device.geoCountry -> "SG" case c at .merchant.merchantCategory -> "ELECTRONICS" }
+var r = RiskRules::evaluate(e, { velocityCount: 1 }, vars.cfg)
+---
+{ score: r.score, band: RiskRules::band(r.score, vars.cfg), codes: r.hits.ruleCode }]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.score]" is="#[MunitTools::equalTo(82)]"/>
+      <munit-tools:assert-that expression="#[payload.band]" is="#[MunitTools::equalTo('HIGH')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============ negative scenario 5: scoring failure fails SAFE to REVIEW ============ -->
+  <munit:test name="scoring-failure-fails-safe-to-review">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::RiskRules
+output application/java
+---
+RiskRules::finalize({ event: (vars.evt update { case t at .eventTimestamp -> "not-a-date" }), scoring: { riskScore: 45, ruleHits: [], scoringFailed: false } }, null, vars.cfg)]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.decision]" is="#[MunitTools::equalTo('REVIEW')]"/>
+      <munit-tools:assert-that expression="#[payload.ruleHits.ruleCode]" is="#[MunitTools::hasItem('SYS_SCORING_FAILURE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============ negative scenario 10: data protection ============ -->
+  <munit:test name="masking-and-sanitising">
+    <munit:execution>
+      <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+import modules::Masking
+output application/json
+---
+{ masked: Masking::maskCard("4111111111114417"), already: Masking::maskCard("XXXXXXXXXXXX4417"),
+  clean: Masking::sanitize("failed for card 4111 1111 1111 4417 at db") }]]></ee:set-payload></ee:message></ee:transform>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.masked]" is="#[MunitTools::equalTo('XXXXXXXXXXXX4417')]"/>
+      <munit-tools:assert-that expression="#[payload.already]" is="#[MunitTools::equalTo('XXXXXXXXXXXX4417')]"/>
+      <munit-tools:assert-that expression="#[payload.clean]" is="#[MunitTools::not(MunitTools::containsString('4111'))]"/>
+    </munit:validation>
+  </munit:test>
+</mule>

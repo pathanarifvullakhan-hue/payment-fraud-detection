@@ -1,0 +1,72 @@
+app:
+  logCategory: "com.cts.fraud"
+http:
+  port: "8081"
+api:
+  id: "REPLACE_WITH_API_MANAGER_ID"
+vm:
+  queue:
+    high: "payments-high-q"
+    standard: "payments-std-q"
+    dlq: "payments-dlq"
+  maxOutstanding: "100000"
+db:
+  host: "localhost"
+  port: "3307"
+  user: "fraud_app"
+  name: "frauddb"
+smtp:
+  host: "localhost"
+  port: "1025"
+  from: "fraud-monitor@example.com"
+dedupe:
+  ttlHours: "24"
+consumer:
+  high:
+    concurrency: "8"
+  standard:
+    concurrency: "4"
+  transient:
+    maxRetries: "720"
+    delayMs: "5000"
+retry:
+  queue:
+    max: "3"
+    delayMs: "500"
+  db:
+    max: "3"
+    delayMs: "1000"
+  smtp:
+    max: "3"
+    delayMs: "2000"
+risk:
+  amountLimit: "100000"
+  velocityMax: "5"
+  velocityWindowSeconds: "300"
+  highRiskCategories: "ELECTRONICS,CRYPTO,GAMBLING,JEWELRY,MONEY_TRANSFER"
+  usualHourStart: "6"
+  usualHourEnd: "23"
+  weight:
+    amount: "35"
+    geo: "30"
+    velocity: "20"
+    merchant: "17"
+    hour: "15"
+    watchlist: "10"
+  band:
+    mediumMin: "30"
+    highMin: "60"
+    blockMin: "85"
+  failSafeScore: "45"
+alert:
+  distributionList: "risk-team@example.com"
+  throttle:
+    windowSeconds: "300"
+    storeTtlMinutes: "60"
+  flushFrequencyMs: "30000"
+  reconcileFrequencyMs: "60000"
+monitor:
+  opsList: "ops-team@example.com"
+  dlqThreshold: "0"
+  highSpikeThreshold: "20"
+  spikeWindowMinutes: "5"

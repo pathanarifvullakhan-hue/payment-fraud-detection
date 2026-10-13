@@ -1,0 +1,50 @@
+#%RAML 1.0
+title: Payment Fraud Detection - Intake API
+version: v1
+mediaType: application/json
+baseUri: https://localhost:8081/api
+
+types:
+  PaymentEvent: !include schemas/payment-event.json
+  AcceptedResponse:
+    type: object
+    properties:
+      eventId: string
+      transactionId: string
+      riskScore: integer
+      riskBand: { enum: [LOW, MEDIUM, HIGH] }
+      status: { enum: [QUEUED_FOR_REVIEW, QUEUED_FOR_SCORING] }
+      correlationId: string
+  ErrorResponse:
+    type: object
+    properties:
+      errorCode: string
+      message: string
+      correlationId: string
+      fields?: string[]
+
+/payments:
+  /events:
+    post:
+      description: Accept a payment event, apply lightweight risk score, queue by priority.
+      headers:
+        X-Correlation-ID:
+          required: false
+          type: string
+          description: Optional inbound correlation id. Generated if absent.
+      body:
+        application/json:
+          type: PaymentEvent
+      responses:
+        202:
+          body:
+            application/json:
+              type: AcceptedResponse
+        400:
+          body: { application/json: { type: ErrorResponse } }
+        409:
+          body: { application/json: { type: ErrorResponse } }
+        503:
+          body: { application/json: { type: ErrorResponse } }
+        500:
+          body: { application/json: { type: ErrorResponse } }

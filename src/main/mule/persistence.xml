@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:email="http://www.mulesoft.org/schema/mule/email"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+        http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <!-- Idempotent + atomic: parent upsert, child delete+insert in ONE DB transaction. Redelivery can never duplicate rows. -->
+  <sub-flow name="persist-fraud-event-sf">
+    <ee:transform doc:name="Build DB params">
+      <ee:variables>
+        <ee:set-variable variableName="dbEvent"><![CDATA[%dw 2.0
+import modules::Masking
+output application/java
+var e = vars.envelope.event
+---
+{
+  eventId: e.eventId,
+  transactionId: e.transaction.transactionId,
+  eventTimestamp: ((e.eventTimestamp as DateTime) >> "UTC") as String { format: "yyyy-MM-dd HH:mm:ss" },
+  customerId: e.customer.customerId,
+  cardToken: e.card.cardToken,
+  maskedCard: Masking::maskCard(e.card.maskedCardNumber),
+  amount: e.transaction.amount,
+  currency: e.transaction.currency,
+  merchantId: e.merchant.merchantId,
+  merchantCountry: e.merchant.merchantCountry,
+  geoCountry: e.device.geoCountry,
+  riskScore: vars.final.riskScore,
+  riskBand: vars.final.riskBand,
+  decision: vars.final.decision,
+  alertStatus: if (vars.alertRequired) "PENDING" else "NOT_REQUIRED",
+  correlationId: vars.corrId
+}]]></ee:set-variable>
+        <ee:set-variable variableName="dbHits"><![CDATA[%dw 2.0
+output application/java
+---
+vars.final.ruleHits map (h) -> { eventId: vars.envelope.event.eventId, ruleCode: h.ruleCode, ruleName: h.ruleName, ruleWeight: h.ruleWeight }]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <until-successful maxRetries="${retry.db.max}" millisBetweenRetries="${retry.db.delayMs}" doc:name="Retry transient DB errors">
+      <try transactionalAction="ALWAYS_BEGIN" doc:name="DB transaction">
+        <db:insert config-ref="Database_Config" doc:name="Upsert fraud_events">
+          <db:sql><![CDATA[INSERT INTO fraud_events
+ (event_id, transaction_id, event_timestamp, customer_id, card_token, masked_card, amount, currency,
+  merchant_id, merchant_country, geo_country, risk_score, risk_band, decision, alert_status, correlation_id)
+ VALUES (:eventId, :transactionId, :eventTimestamp, :customerId, :cardToken, :maskedCard, :amount, :currency,
+  :merchantId, :merchantCountry, :geoCountry, :riskScore, :riskBand, :decision, :alertStatus, :correlationId)
+ ON DUPLICATE KEY UPDATE risk_score = VALUES(risk_score), risk_band = VALUES(risk_band), decision = VALUES(decision)]]></db:sql>
+          <db:input-parameters>#[vars.dbEvent]</db:input-parameters>
+        </db:insert>
+        <db:delete config-ref="Database_Config" doc:name="Clear old hits (redelivery safe)">
+          <db:sql>DELETE FROM fraud_rule_hits WHERE event_id = :eventId</db:sql>
+          <db:input-parameters>#[{ eventId: vars.dbEvent.eventId }]</db:input-parameters>
+        </db:delete>
+        <choice>
+          <when expression="#[sizeOf(vars.dbHits) &gt; 0]">
+            <db:bulk-insert config-ref="Database_Config" doc:name="Insert rule hits">
+              <db:bulk-input-parameters>#[vars.dbHits]</db:bulk-input-parameters>
+              <db:sql>INSERT INTO fraud_rule_hits (event_id, rule_code, rule_name, rule_weight) VALUES (:eventId, :ruleCode, :ruleName, :ruleWeight)</db:sql>
+            </db:bulk-insert>
+          </when>
+        </choice>
+      </try>
+    </until-successful>
+    <logger level="INFO" category="${app.logCategory}.persist" message="#[output text/plain --- 'PERSISTED eventId=' ++ vars.eventId ++ ' hits=' ++ sizeOf(vars.dbHits) ++ ' enrichmentIncomplete=' ++ (vars.enrichmentIncomplete default false) ++ ' corrId=' ++ vars.corrId]"/>
+  </sub-flow>
+</mule>

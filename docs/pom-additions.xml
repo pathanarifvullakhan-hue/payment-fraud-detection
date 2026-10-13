@@ -1,0 +1,21 @@
+<!-- Open pom.xml in Studio (bottom tab "pom.xml") and add the pieces below. Do NOT replace the whole file. -->
+
+<!-- 1) Inside <dependencies> ... </dependencies> -->
+<dependency>
+  <groupId>com.mysql</groupId>
+  <artifactId>mysql-connector-j</artifactId>
+  <version>8.3.0</version>
+</dependency>
+
+<!-- 2) Inside the mule-maven-plugin block, inside its <configuration> ... </configuration> -->
+<sharedLibraries>
+  <sharedLibrary>
+    <groupId>com.mysql</groupId>
+    <artifactId>mysql-connector-j</artifactId>
+  </sharedLibrary>
+</sharedLibraries>
+
+<!-- 3) Only AFTER MUnit was added (Part 7 of README): inside munit-maven-plugin <configuration> ... </configuration> -->
+<systemPropertyVariables>
+  <secure.key>mySecretKey</secure.key>
+</systemPropertyVariables>

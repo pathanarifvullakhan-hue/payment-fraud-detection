@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:email="http://www.mulesoft.org/schema/mule/email"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+        http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <!-- Hand-off from consumer to the alert pipeline. DB row already says alert_status=PENDING, so a crash here is recovered by the reconciler. -->
+  <sub-flow name="enqueue-alert-sf">
+    <ee:transform doc:name="Build alert message">
+      <ee:variables>
+        <ee:set-variable variableName="alertMsg"><![CDATA[%dw 2.0
+import modules::Masking
+output application/json
+var e = vars.envelope.event
+---
+{
+  "type": "ALERT",
+  eventId: e.eventId,
+  transactionId: e.transaction.transactionId,
+  eventTimestamp: e.eventTimestamp,
+  amount: e.transaction.amount,
+  currency: e.transaction.currency,
+  maskedCard: Masking::maskCard(e.card.maskedCardNumber),
+  cardToken: e.card.cardToken,
+  cardType: e.card.cardType,
+  customerId: e.customer.customerId,
+  customerName: e.customer.name,
+  merchantName: e.merchant.merchantName,
+  merchantCountry: e.merchant.merchantCountry,
+  riskScore: vars.final.riskScore,
+  riskBand: vars.final.riskBand,
+  decision: vars.final.decision,
+  ruleHits: vars.final.ruleHits,
+  correlationId: vars.corrId
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <vm:publish config-ref="VM_Config" queueName="alertQueue" doc:name="Publish alert">
+      <vm:content>#[vars.alertMsg]</vm:content>
+    </vm:publish>
+  </sub-flow>
+
+  <!-- ONE consumer thread => throttle decisions are serialised (no race on the throttle store). Run with 1 worker. -->
+  <flow name="alert-dispatch-flow" maxConcurrency="1">
+    <vm:listener config-ref="VM_Config" queueName="alertQueue" numberOfConsumers="1" doc:name="Alert listener"/>
+    <ee:transform doc:name="Parse alert msg">
+      <ee:variables>
+        <ee:set-variable variableName="alert"><![CDATA[%dw 2.0
+output application/java
+---
+if (payload is String) read(payload, "application/json") else payload]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <set-variable variableName="corrId" value="#[vars.alert.correlationId default correlationId]"/>
+    <choice>
+      <when expression="#[vars.alert.&quot;type&quot; == 'FLUSH']"><flow-ref name="alert-flush-sf"/></when>
+      <otherwise><flow-ref name="alert-process-sf"/></otherwise>
+    </choice>
+    <error-handler>
+      <!-- never lose an alert: failures leave alert_status=PENDING and the reconciler re-queues it -->
+      <on-error-continue logException="false">
+        <logger level="ERROR" category="${app.logCategory}.alert" message="#[output text/plain --- 'ALERT_PIPELINE_ERROR type=' ++ error.errorType.identifier ++ ' corrId=' ++ (vars.corrId default 'n/a') ++ ' desc=' ++ (error.description default '')]"/>
+      </on-error-continue>
+    </error-handler>
+  </flow>
+
+  <!-- ===== Throttle + send. Three outcomes: IMMEDIATE | SUPPRESS | AGGREGATE ===== -->
+  <sub-flow name="alert-process-sf">
+    <os:retrieve key="#[vars.alert.cardToken]" objectStore="alertThrottleStore" target="entry" doc:name="Get throttle entry">
+      <os:default-value>#[{ windowEnd: 0, suppressed: [] }]</os:default-value>
+    </os:retrieve>
+    <set-variable variableName="alertAction" doc:name="Decide action"
+      value="#[if (vars.entry != null and vars.entry.windowEnd &gt; (now() as Number)) 'SUPPRESS' else if (vars.entry != null and sizeOf(vars.entry.suppressed default []) &gt; 0) 'AGGREGATE' else 'IMMEDIATE']"/>
+    <ee:transform doc:name="Summary of this txn">
+      <ee:variables>
+        <ee:set-variable variableName="summary"><![CDATA[%dw 2.0
+output application/java
+---
+{
+  eventId: vars.alert.eventId, transactionId: vars.alert.transactionId, eventTimestamp: vars.alert.eventTimestamp,
+  amount: vars.alert.amount, currency: vars.alert.currency, merchantName: vars.alert.merchantName,
+  riskScore: vars.alert.riskScore, ruleCodes: vars.alert.ruleHits.ruleCode
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <logger level="INFO" category="${app.logCategory}.alert" message="#[output text/plain --- 'ALERT_DECISION action=' ++ vars.alertAction ++ ' eventId=' ++ vars.alert.eventId ++ ' corrId=' ++ vars.corrId]"/>
+
+    <choice>
+      <!-- 1) inside window: suppress, remember the txn for the aggregate -->
+      <when expression="#[vars.alertAction == 'SUPPRESS']">
+        <os:store key="#[vars.alert.cardToken]" objectStore="alertThrottleStore" failIfPresent="false" doc:name="Append suppressed txn">
+          <os:value><![CDATA[#[{ windowEnd: vars.entry.windowEnd, maskedCard: vars.alert.maskedCard, suppressed: ((vars.entry.suppressed default []) ++ [vars.summary]) }]]]></os:value>
+        </os:store>
+        <set-variable variableName="statusIds" value="#[[vars.alert.eventId]]"/>
+        <set-variable variableName="newStatus" value="SUPPRESSED"/>
+        <flow-ref name="update-alert-status-sf"/>
+      </when>
+
+      <!-- 2) window ended with suppressed txns: send ONE aggregate listing every txn (incl. this one) -->
+      <when expression="#[vars.alertAction == 'AGGREGATE']">
+        <set-variable variableName="aggKey" value="#[vars.alert.cardToken]"/>
+        <set-variable variableName="aggMasked" value="#[vars.alert.maskedCard]"/>
+        <set-variable variableName="aggItems" value="#[((vars.entry.suppressed default []) ++ [vars.summary])]"/>
+        <flow-ref name="send-aggregate-sf"/>
+      </when>
+
+      <!-- 3) first alert in window: send immediately, open window -->
+      <otherwise>
+        <try doc:name="Send single alert">
+          <until-successful maxRetries="${retry.smtp.max}" millisBetweenRetries="${retry.smtp.delayMs}">
+            <email:send config-ref="SMTP_Config" fromAddress="${smtp.from}" subject="#[modules::AlertTemplates::subject(vars.alert)]" doc:name="Send email">
+              <email:to-addresses><email:to-address value="${alert.distributionList}"/></email:to-addresses>
+              <email:body contentType="text/plain; charset=UTF-8"><email:content><![CDATA[#[modules::AlertTemplates::body(vars.alert)]]]></email:content></email:body>
+            </email:send>
+          </until-successful>
+          <os:store key="#[vars.alert.cardToken]" objectStore="alertThrottleStore" failIfPresent="false" doc:name="Open window">
+            <os:value><![CDATA[#[{ windowEnd: (now() as Number) + (p('alert.throttle.windowSeconds') as Number), maskedCard: vars.alert.maskedCard, suppressed: [] }]]]></os:value>
+          </os:store>
+          <set-variable variableName="statusIds" value="#[[vars.alert.eventId]]"/>
+          <set-variable variableName="newStatus" value="SENT"/>
+          <flow-ref name="update-alert-status-sf"/>
+          <logger level="INFO" category="${app.logCategory}.alert" message="#[output text/plain --- 'ALERT_SENT eventId=' ++ vars.alert.eventId ++ ' corrId=' ++ vars.corrId]"/>
+          <error-handler>
+            <!-- SMTP down after retries: keep alert_status=PENDING; reconciler will try again. Nothing is silently dropped. -->
+            <on-error-continue logException="false">
+              <logger level="ERROR" category="${app.logCategory}.alert" message="#[output text/plain --- 'ALERT_EMAIL_FAILED eventId=' ++ vars.alert.eventId ++ ' status=PENDING type=' ++ error.errorType.identifier ++ ' corrId=' ++ vars.corrId]"/>
+            </on-error-continue>
+          </error-handler>
+        </try>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="send-aggregate-sf">
+    <try doc:name="Send aggregate">
+      <until-successful maxRetries="${retry.smtp.max}" millisBetweenRetries="${retry.smtp.delayMs}">
+        <email:send config-ref="SMTP_Config" fromAddress="${smtp.from}" subject="#[modules::AlertTemplates::aggregateSubject(vars.aggMasked, sizeOf(vars.aggItems))]" doc:name="Send aggregate email">
+          <email:to-addresses><email:to-address value="${alert.distributionList}"/></email:to-addresses>
+          <email:body contentType="text/plain; charset=UTF-8"><email:content><![CDATA[#[modules::AlertTemplates::aggregateBody(vars.aggMasked, vars.aggItems)]]]></email:content></email:body>
+        </email:send>
+      </until-successful>
+      <os:remove key="#[vars.aggKey]" objectStore="alertThrottleStore" doc:name="Close window"/>
+      <set-variable variableName="statusIds" value="#[vars.aggItems.eventId]"/>
+      <set-variable variableName="newStatus" value="AGGREGATED_SENT"/>
+      <flow-ref name="update-alert-status-sf"/>
+      <logger level="INFO" category="${app.logCategory}.alert" message="#[output text/plain --- 'AGGREGATE_ALERT_SENT card=' ++ vars.aggMasked ++ ' txns=' ++ sizeOf(vars.aggItems)]"/>
+      <error-handler>
+        <!-- entry is kept, so the next flush tick retries; nothing lost -->
+        <on-error-continue logException="false">
+          <logger level="ERROR" category="${app.logCategory}.alert" message="#[output text/plain --- 'AGGREGATE_EMAIL_FAILED card=' ++ vars.aggMasked ++ ' will retry on next flush type=' ++ error.errorType.identifier]"/>
+        </on-error-continue>
+      </error-handler>
+    </try>
+  </sub-flow>
+
+  <sub-flow name="update-alert-status-sf">
+    <until-successful maxRetries="${retry.db.max}" millisBetweenRetries="${retry.db.delayMs}">
+      <db:bulk-update config-ref="Database_Config" doc:name="Update alert_status">
+        <db:bulk-input-parameters>#[vars.statusIds map (id) -> { eventId: id, status: vars.newStatus }]</db:bulk-input-parameters>
+        <db:sql>UPDATE fraud_events SET alert_status = :status WHERE event_id = :eventId</db:sql>
+      </db:bulk-update>
+    </until-successful>
+  </sub-flow>
+
+  <!-- ===== FLUSH: scheduler asks the serialised alert flow to close expired windows ===== -->
+  <flow name="alert-flush-scheduler-flow">
+    <scheduler doc:name="Every N sec"><scheduling-strategy><fixed-frequency frequency="${alert.flushFrequencyMs}"/></scheduling-strategy></scheduler>
+    <vm:publish config-ref="VM_Config" queueName="alertQueue"><vm:content>#[output application/json --- { "type": "FLUSH" }]</vm:content></vm:publish>
+  </flow>
+
+  <sub-flow name="alert-flush-sf">
+    <os:retrieve-all-keys objectStore="alertThrottleStore" target="throttleKeys" doc:name="All keys"/>
+    <foreach collection="#[vars.throttleKeys]">
+      <try>
+        <set-variable variableName="aggKey" value="#[payload]"/>
+        <os:retrieve key="#[vars.aggKey]" objectStore="alertThrottleStore" target="entry"><os:default-value>#[{ windowEnd: 99999999999, suppressed: [] }]</os:default-value></os:retrieve>
+        <choice>
+          <when expression="#[vars.entry != null and vars.entry.windowEnd &lt;= (now() as Number) and sizeOf(vars.entry.suppressed default []) &gt; 0]">
+            <set-variable variableName="aggMasked" value="#[vars.entry.maskedCard]"/>
+            <set-variable variableName="aggItems" value="#[vars.entry.suppressed]"/>
+            <flow-ref name="send-aggregate-sf"/>
+          </when>
+          <when expression="#[vars.entry != null and vars.entry.windowEnd &lt;= (now() as Number)]">
+            <os:remove key="#[vars.aggKey]" objectStore="alertThrottleStore"/>
+          </when>
+        </choice>
+        <error-handler>
+          <on-error-continue logException="false">
+            <logger level="WARN" category="${app.logCategory}.alert" message="#[output text/plain --- 'FLUSH_ITEM_FAILED type=' ++ error.errorType.identifier]"/>
+          </on-error-continue>
+        </error-handler>
+      </try>
+    </foreach>
+  </sub-flow>
+
+  <!-- ===== RECONCILER: any HIGH/BLOCK event still PENDING after 1 min is re-queued (at-least-once) ===== -->
+  <flow name="pending-alert-reconciler-flow">
+    <scheduler doc:name="Every N sec"><scheduling-strategy><fixed-frequency frequency="${alert.reconcileFrequencyMs}"/></scheduling-strategy></scheduler>
+    <db:select config-ref="Database_Config" doc:name="Pending alerts">
+      <db:sql>SELECT event_id, transaction_id, event_timestamp, customer_id, card_token, masked_card, amount, currency, merchant_id, merchant_country, risk_score, risk_band, decision, correlation_id
+               FROM fraud_events WHERE alert_status = 'PENDING' AND created_at &lt; (NOW() - INTERVAL 1 MINUTE) ORDER BY created_at LIMIT 50</db:sql>
+    </db:select>
+    <foreach>
+      <set-variable variableName="row" value="#[payload]"/>
+      <db:select config-ref="Database_Config" target="hitRows">
+        <db:sql>SELECT rule_code, rule_name, rule_weight FROM fraud_rule_hits WHERE event_id = :id</db:sql>
+        <db:input-parameters>#[{ id: vars.row.event_id }]</db:input-parameters>
+      </db:select>
+      <ee:transform doc:name="Rebuild alert">
+        <ee:variables>
+          <ee:set-variable variableName="alertMsg"><![CDATA[%dw 2.0
+output application/json
+---
+{
+  "type": "ALERT", eventId: vars.row.event_id, transactionId: vars.row.transaction_id, eventTimestamp: vars.row.event_timestamp as String,
+  amount: vars.row.amount, currency: vars.row.currency, maskedCard: vars.row.masked_card, cardToken: vars.row.card_token,
+  customerId: vars.row.customer_id, merchantName: vars.row.merchant_id, merchantCountry: vars.row.merchant_country,
+  riskScore: vars.row.risk_score, riskBand: vars.row.risk_band, decision: vars.row.decision,
+  ruleHits: vars.hitRows map (h) -> { ruleCode: h.rule_code, ruleName: h.rule_name, ruleWeight: h.rule_weight },
+  correlationId: vars.row.correlation_id
+}]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+      <vm:publish config-ref="VM_Config" queueName="alertQueue"><vm:content>#[vars.alertMsg]</vm:content></vm:publish>
+    </foreach>
+  </flow>
+
+  <!-- ===== MONITOR: sudden spike in HIGH band events (DLQ monitor lives in dead-letter.xml) ===== -->
+  <flow name="high-band-spike-monitor-flow">
+    <scheduler doc:name="Every minute"><scheduling-strategy><fixed-frequency frequency="60000"/></scheduling-strategy></scheduler>
+    <db:select config-ref="Database_Config" target="spikeRows">
+      <db:sql>SELECT COUNT(*) AS cnt FROM fraud_events WHERE risk_band = 'HIGH' AND created_at &gt;= (NOW() - INTERVAL ${monitor.spikeWindowMinutes} MINUTE)</db:sql>
+    </db:select>
+    <os:contains key="spike-cooldown" objectStore="spikeStore" target="cooling"/>
+    <choice>
+      <when expression="#[(vars.spikeRows[0].cnt as Number) &gt; (p('monitor.highSpikeThreshold') as Number) and not vars.cooling]">
+        <logger level="ERROR" category="${app.logCategory}.monitor" message="#[output text/plain --- 'HIGH_BAND_SPIKE count=' ++ vars.spikeRows[0].cnt ++ ' window=${monitor.spikeWindowMinutes}min']"/>
+        <email:send config-ref="SMTP_Config" fromAddress="${smtp.from}" subject="#['[MONITOR] Spike in HIGH-risk payments: ' ++ vars.spikeRows[0].cnt ++ ' in last ${monitor.spikeWindowMinutes} min']">
+          <email:to-addresses><email:to-address value="${monitor.opsList}"/></email:to-addresses>
+          <email:body contentType="text/plain; charset=UTF-8"><email:content>Possible coordinated attack. Check the fraud review console.</email:content></email:body>
+        </email:send>
+        <os:store key="spike-cooldown" objectStore="spikeStore" failIfPresent="false"><os:value>#[true]</os:value></os:store>
+      </when>
+    </choice>
+  </flow>
+</mule>

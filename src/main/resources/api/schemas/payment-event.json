@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "type": "object",
+  "required": ["eventId", "eventTimestamp", "transaction", "card", "customer", "merchant"],
+  "properties": {
+    "eventId": { "type": "string", "minLength": 1, "maxLength": 30, "pattern": "^[A-Za-z0-9_-]+$" },
+    "eventTimestamp": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$" },
+    "transaction": {
+      "type": "object",
+      "required": ["transactionId", "amount", "currency", "channel"],
+      "properties": {
+        "transactionId": { "type": "string", "minLength": 1, "maxLength": 30 },
+        "amount": { "type": "number", "minimum": 0, "exclusiveMinimum": true, "maximum": 999999999999.99 },
+        "currency": { "enum": ["INR", "USD", "EUR", "GBP", "SGD", "AED", "AUD", "JPY"] },
+        "channel": { "enum": ["ONLINE", "POS", "ATM", "MOBILE", "IVR"] },
+        "entryMode": { "type": "string", "maxLength": 30 }
+      }
+    },
+    "card": {
+      "type": "object",
+      "required": ["cardToken", "maskedCardNumber", "issuingCountry"],
+      "properties": {
+        "cardToken": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "maskedCardNumber": { "type": "string", "pattern": "^[Xx*]{6,15}[0-9]{4}$" },
+        "cardType": { "enum": ["CREDIT", "DEBIT", "PREPAID"] },
+        "issuingCountry": { "type": "string", "pattern": "^[A-Z]{2}$" }
+      }
+    },
+    "customer": {
+      "type": "object",
+      "required": ["customerId"],
+      "properties": {
+        "customerId": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "name": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 120 },
+        "riskProfile": { "enum": ["STANDARD", "TRUSTED", "WATCHLIST"] }
+      }
+    },
+    "merchant": {
+      "type": "object",
+      "required": ["merchantId", "merchantCategory"],
+      "properties": {
+        "merchantId": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "merchantName": { "type": "string", "maxLength": 120 },
+        "merchantCategory": { "type": "string", "maxLength": 40 },
+        "merchantCountry": { "type": "string", "pattern": "^[A-Z]{2}$" }
+      }
+    },
+    "device": {
+      "type": "object",
+      "properties": {
+        "ipAddress": { "type": "string" },
+        "deviceId": { "type": "string" },
+        "geoCountry": { "type": "string", "pattern": "^[A-Z]{2}$" }
+      }
+    }
+  }
+}

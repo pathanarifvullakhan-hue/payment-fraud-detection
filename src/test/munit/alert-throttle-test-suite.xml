@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:email="http://www.mulesoft.org/schema/mule/email"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd">
+
+  <munit:config name="alert-throttle-test-suite.xml"/>
+
+  <munit:before-test name="mocks-and-alert">
+    <munit-tools:mock-when processor="email:send"><munit-tools:then-return><munit-tools:payload value="#['sent']"/></munit-tools:then-return></munit-tools:mock-when>
+    <munit-tools:mock-when processor="os:store"><munit-tools:then-return><munit-tools:payload value="#['ok']"/></munit-tools:then-return></munit-tools:mock-when>
+    <munit-tools:mock-when processor="os:remove"><munit-tools:then-return><munit-tools:payload value="#['ok']"/></munit-tools:then-return></munit-tools:mock-when>
+    <munit-tools:mock-when processor="db:bulk-update"><munit-tools:then-return><munit-tools:payload value="#[[]]"/></munit-tools:then-return></munit-tools:mock-when>
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="alert"><![CDATA[%dw 2.0
+output application/java
+---
+{ eventId: "E-3", transactionId: "TX-3", eventTimestamp: "2026-09-11T14:22:07+05:30", amount: 248500, currency: "INR",
+  maskedCard: "XXXXXXXXXXXX4417", cardToken: "TKN-1", cardType: "CREDIT", customerId: "C-1", customerName: "Test User",
+  merchantName: "Global Gadgets", merchantCountry: "SG", riskScore: 82, riskBand: "HIGH", decision: "REVIEW",
+  ruleHits: [{ ruleCode: "R01_AMOUNT", ruleName: "Amount", ruleWeight: 35 }], correlationId: "corr-1" }]]></ee:set-variable>
+        <ee:set-variable variableName="corrId"><![CDATA[%dw 2.0
+output application/java
+---
+"corr-1"]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </munit:before-test>
+
+  <munit:test name="throttle-first-alert-is-sent-immediately">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve"><munit-tools:then-return>
+        <munit-tools:payload value="#[{ windowEnd: 1, maskedCard: 'XXXXXXXXXXXX4417', suppressed: [] }]"/>
+        <munit-tools:variables><munit-tools:variable key="entry" value="#[{ windowEnd: 1, maskedCard: 'XXXXXXXXXXXX4417', suppressed: [] }]"/></munit-tools:variables>
+      </munit-tools:then-return></munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution><flow-ref name="alert-process-sf"/></munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.alertAction]" is="#[MunitTools::equalTo('IMMEDIATE')]"/>
+      <munit-tools:verify-call processor="email:send" times="1"/>
+      <munit-tools:verify-call processor="os:store" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="throttle-repeat-inside-window-is-suppressed-no-email">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve"><munit-tools:then-return>
+        <munit-tools:payload value="#[{ windowEnd: 99999999999, maskedCard: 'XXXXXXXXXXXX4417', suppressed: [] }]"/>
+        <munit-tools:variables><munit-tools:variable key="entry" value="#[{ windowEnd: 99999999999, maskedCard: 'XXXXXXXXXXXX4417', suppressed: [] }]"/></munit-tools:variables>
+      </munit-tools:then-return></munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution><flow-ref name="alert-process-sf"/></munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.alertAction]" is="#[MunitTools::equalTo('SUPPRESS')]"/>
+      <munit-tools:verify-call processor="email:send" times="0"/>
+      <munit-tools:verify-call processor="os:store" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="throttle-window-end-sends-ONE-aggregate-listing-every-txn">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve"><munit-tools:then-return>
+        <munit-tools:payload value="#[{ windowEnd: 1, maskedCard: 'XXXXXXXXXXXX4417', suppressed: [{ eventId: 'E-1', transactionId: 'TX-1', amount: 1, currency: 'INR', riskScore: 70, ruleCodes: ['R01'] }, { eventId: 'E-2', transactionId: 'TX-2', amount: 2, currency: 'INR', riskScore: 71, ruleCodes: ['R02'] }] }]"/>
+        <munit-tools:variables><munit-tools:variable key="entry" value="#[{ windowEnd: 1, maskedCard: 'XXXXXXXXXXXX4417', suppressed: [{ eventId: 'E-1', transactionId: 'TX-1', amount: 1, currency: 'INR', riskScore: 70, ruleCodes: ['R01'] }, { eventId: 'E-2', transactionId: 'TX-2', amount: 2, currency: 'INR', riskScore: 71, ruleCodes: ['R02'] }] }]"/></munit-tools:variables>
+      </munit-tools:then-return></munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution><flow-ref name="alert-process-sf"/></munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.alertAction]" is="#[MunitTools::equalTo('AGGREGATE')]"/>
+      <munit-tools:assert-that expression="#[sizeOf(vars.aggItems)]" is="#[MunitTools::equalTo(3)]"/>
+      <munit-tools:verify-call processor="email:send" times="1"/>
+      <munit-tools:verify-call processor="os:remove" times="1"/>
+    </munit:validation>
+  </munit:test>
+</mule>

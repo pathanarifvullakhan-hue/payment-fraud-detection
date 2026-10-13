@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- TEST ONLY. Rename to test-tools.xml to enable, delete before the demo/deploy.
+     POST http://localhost:8081/test/poison drops a broken message on the standard queue to prove the dead-letter path. -->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd">
+  <flow name="test-poison-flow">
+    <http:listener config-ref="HTTP_Listener_config" path="/test/poison" doc:name="Listener"/>
+    <vm:publish config-ref="VM_Config" queueName="${vm.queue.standard}" doc:name="Publish junk">
+      <vm:content>#["this is { not json"]</vm:content>
+    </vm:publish>
+    <set-payload value="poison message published" doc:name="Reply"/>
+  </flow>
+</mule>
