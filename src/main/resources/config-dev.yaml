@@ -3,7 +3,7 @@ app:
 http:
   port: "8081"
 api:
-  id: "REPLACE_WITH_API_MANAGER_ID"
+  id: "12345678"
 vm:
   queue:
     high: "payments-high-q"

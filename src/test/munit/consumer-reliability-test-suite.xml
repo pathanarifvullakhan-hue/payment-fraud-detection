@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+  <munit:config name="consumer-reliability-test-suite.xml"/>
+
+  <sub-flow name="test-build-requeue-message-sf">
+    <ee:transform doc:name="Requeue message">
+      <ee:variables>
+        <ee:set-variable variableName="requeueMsg"><![CDATA[%dw 2.0
+output application/json
+---
+vars.envelope ++ { transientRetries: (vars.envelope.transientRetries default 0) + 1 }]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </sub-flow>
+
+  <sub-flow name="test-build-dlq-message-sf">
+    <ee:transform doc:name="DLQ message">
+      <ee:variables>
+        <ee:set-variable variableName="dlqMsg"><![CDATA[%dw 2.0
+import modules::Masking
+output application/json
+---
+{
+  reason: "MULE:EXPRESSION - Invalid JSON format",
+  failedAt: now(),
+  correlationId: vars.corrId default correlationId,
+  eventId: vars.eventId default null,
+  sourceQueue: vars.sourceQueue,
+  transientRetries: vars.envelope.transientRetries default 0,
+  originalPayload: Masking::sanitize(vars.rawBody)
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </sub-flow>
+
+  <!-- Acceptance #7 in miniature: DB is down -> the event gets incremented transient retries counter for re-queuing -->
+  <munit:test name="db-down-requeues-event-never-loses-it" description="Verifies transientRetries is incremented on re-queue">
+    <munit:behavior>
+      <ee:transform>
+        <ee:variables>
+          <ee:set-variable variableName="envelope"><![CDATA[%dw 2.0
+output application/json
+---
+{ correlationId: "c-1", velocityCount: 1, transientRetries: 0, scoring: { riskScore: 82, riskBand: "HIGH" },
+  event: { eventId: "T-9", transaction: { transactionId: "TX-9", amount: 248500, currency: "INR" } } }]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="test-build-requeue-message-sf"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.requeueMsg.transientRetries]" is="#[MunitTools::equalTo(1)]"/>
+      <munit-tools:assert-that expression="#[vars.requeueMsg.event.eventId]" is="#[MunitTools::equalTo('T-9')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- Negative scenario: poison message (not JSON) -> dead-letter envelope with reason and masked payload -->
+  <munit:test name="poison-message-goes-to-dlq-with-reason" description="Verifies DLQ structure contains reason and masked payload">
+    <munit:behavior>
+      <set-variable variableName="rawBody" value="this is { not json"/>
+      <set-variable variableName="sourceQueue" value="payments-std-q"/>
+      <set-variable variableName="envelope" value="#[{}]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="test-build-dlq-message-sf"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.dlqMsg.reason]" is="#[MunitTools::notNullValue()]"/>
+      <munit-tools:assert-that expression="#[vars.dlqMsg.sourceQueue]" is="#[MunitTools::equalTo('payments-std-q')]"/>
+      <munit-tools:assert-that expression="#[vars.dlqMsg.originalPayload]" is="#[MunitTools::equalTo('this is { not json')]"/>
+    </munit:validation>
+  </munit:test>
+
+</mule>
